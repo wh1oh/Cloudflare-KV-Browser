@@ -1,5 +1,36 @@
+// 保留的 env 变量名（不能作为 KV namespace）
+const RESERVED_ENV = new Set(['SECRET_KEY', 'PASSWORD', 'USER']);
+
 export default {
   async fetch(request, env) {
+
+    // ── 必需环境变量检查 ───────────────────────────────────────────────────────
+
+    if (!env.SECRET_KEY || !env.PASSWORD || !env.USER) {
+      return html(`<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>KV Manager</title>
+<style>
+*{ box-sizing:border-box; }
+body{ margin:0; height:100vh; display:flex; align-items:center; justify-content:center; background:#f5f5f5; font-family:Inter,sans-serif; }
+.box{ width:360px; background:#fff; border:1px solid #e5e5e5; border-radius:16px; padding:24px; }
+h1{ margin:0 0 12px; font-size:20px; }
+p{ margin:0 0 16px; font-size:14px; color:#555; line-height:1.6; }
+code{ background:#f3f3f3; border-radius:6px; padding:2px 6px; font-size:13px; }
+</style>
+</head>
+<body>
+<div class="box">
+<h1>Configuration Required</h1>
+<p>Please set the following environment variables in your Worker settings:</p>
+<p><code>USER</code> &nbsp; <code>PASSWORD</code> &nbsp; <code>SECRET_KEY</code></p>
+</div>
+</body>
+</html>`);
+    }
 
     const url  = new URL(request.url);
     const path = url.pathname;
@@ -24,16 +55,16 @@ export default {
       const userOk = fd.get('user') === env.USER;
       const passOk = await verifyPassword(
         fd.get('pass') || '',
-        env.PASSWORD   || '',
-        env.SECRET_KEY || 'fallback-secret'
+        env.PASSWORD,
+        env.SECRET_KEY
       );
 
       if (userOk && passOk) {
 
-        // 生成签名 cookie：payload = user:expire，再附上 HMAC 签名
+        // 生成签名 cookie：payload 只存 expire，不暴露用户名
         const expire  = Date.now() + 86400 * 1000; // 24 小时
-        const payload = `${env.USER}:${expire}`;
-        const sig     = await hmacSign(payload, env.SECRET_KEY || 'fallback-secret');
+        const payload = String(expire);
+        const sig     = await hmacSign(payload, env.SECRET_KEY);
         const token   = btoa(payload) + '.' + sig;
 
         return redirect('/', {
@@ -57,7 +88,7 @@ export default {
 
     const sessionValid = await verifySession(
       cookies.session,
-      env.SECRET_KEY || 'fallback-secret'
+      env.SECRET_KEY
     );
 
     if (!sessionValid) {
@@ -70,13 +101,14 @@ export default {
 
       const ns  = url.searchParams.get('ns');
       const key = url.searchParams.get('key');
-      const kv  = env[ns];
 
-      if (!kv) return new Response('KV not found', { status: 404 });
+      if (RESERVED_ENV.has(ns)) return new Response('Not found', { status: 404 });
+
+      const kv = env[ns];
+      if (!kv || typeof kv.get !== 'function') return new Response('Not found', { status: 404 });
 
       const file = await kv.get(key, { type: 'arrayBuffer' });
-
-      if (!file) return new Response('File not found', { status: 404 });
+      if (!file) return new Response('Not found', { status: 404 });
 
       return new Response(file, {
         headers: {
@@ -93,9 +125,11 @@ export default {
       const fd     = await request.formData();
       const action = fd.get('action');
       const ns     = fd.get('ns');
-      const kv     = env[ns];
 
-      if (!kv) return new Response('KV not found', { status: 404 });
+      if (RESERVED_ENV.has(ns)) return new Response('Not found', { status: 404 });
+
+      const kv = env[ns];
+      if (!kv || typeof kv.get !== 'function') return new Response('Not found', { status: 404 });
 
       try {
 
@@ -122,8 +156,15 @@ export default {
 
         if (action === 'delete') {
 
-          const key = fd.get('key');
+          const key   = fd.get('key');
+          const token = fd.get('delete_token');
           if (!key) throw new Error('Missing key');
+
+          // 服务端验证删除 token，防止绕过前端 confirm 直接 POST
+          const expectedToken = await hmacSign(`delete:${ns}:${key}`, env.SECRET_KEY);
+          if (!token || !timingSafeEqual(token, expectedToken)) {
+            throw new Error('Invalid delete token');
+          }
 
           await kv.delete(key);
 
@@ -140,15 +181,12 @@ export default {
     }
 
     const kvList = await getKVList(env);
-    return html(render(kvList, url));
+    return html(await render(kvList, url, env));
   }
 };
 
 // ── security helpers ──────────────────────────────────────────────────────────
 
-/**
- * 用 HMAC-SHA256 对字符串签名，返回 hex 字符串
- */
 async function hmacSign(data, secret) {
   const enc = new TextEncoder();
   const key = await crypto.subtle.importKey(
@@ -163,7 +201,7 @@ async function hmacSign(data, secret) {
 
 /**
  * 验证 session cookie
- * 格式：base64(user:expire).hmac
+ * 格式：base64(expire).hmac
  */
 async function verifySession(token, secret) {
   if (!token) return false;
@@ -175,12 +213,10 @@ async function verifySession(token, secret) {
     const sig     = token.slice(dotIdx + 1);
     const payload = atob(b64);
 
-    // 验证签名
     const expectedSig = await hmacSign(payload, secret);
     if (!timingSafeEqual(sig, expectedSig)) return false;
 
-    // 验证过期时间
-    const expire = parseInt(payload.split(':')[1], 10);
+    const expire = parseInt(payload, 10);
     if (!expire || Date.now() > expire) return false;
 
     return true;
@@ -189,9 +225,6 @@ async function verifySession(token, secret) {
   }
 }
 
-/**
- * 密码 HMAC 比较，防时序攻击
- */
 async function verifyPassword(input, stored, secret) {
   const enc = new TextEncoder();
   const key = await crypto.subtle.importKey(
@@ -208,9 +241,6 @@ async function verifyPassword(input, stored, secret) {
   return timingSafeEqual(toHex(sigInput), toHex(sigStored));
 }
 
-/**
- * 恒定时间字符串比较，防时序攻击
- */
 function timingSafeEqual(a, b) {
   if (a.length !== b.length) return false;
   let diff = 0;
@@ -235,6 +265,7 @@ function guessType(name) {
 async function getKVList(env) {
   const out = {};
   for (const k in env) {
+    if (RESERVED_ENV.has(k)) continue; // 跳过保留变量
     if (env[k] && typeof env[k].list === 'function') {
       try {
         const list  = await env[k].list({ limit: 1000 });
@@ -319,7 +350,7 @@ ${err ? `<div class="err">${esc(err)}</div>` : ''}
 
 // ── main ui ───────────────────────────────────────────────────────────────────
 
-function render(kvList, url) {
+async function render(kvList, url, env) {
 
   const namespaces  = Object.keys(kvList);
   const firstNs     = namespaces[0] || '';
@@ -328,6 +359,11 @@ function render(kvList, url) {
   const deletedKey  = url.searchParams.get('deleted') || '';
   const files       = (kvList[selectedNs] || []).filter(f => f.name !== deletedKey);
   const current     = files.find(f => f.name === selectedKey);
+
+  // 为当前选中文件预计算删除 token
+  const deleteToken = current
+    ? await hmacSign(`delete:${selectedNs}:${current.name}`, env.SECRET_KEY)
+    : '';
 
   return `<!DOCTYPE html>
 <html>
@@ -430,6 +466,7 @@ ${current.type.startsWith('image/') ? `<img class="preview" src="/download?ns=${
 <input type="hidden" name="action" value="delete"/>
 <input type="hidden" name="ns" value="${esc(selectedNs)}"/>
 <input type="hidden" name="key" value="${esc(current.name)}"/>
+<input type="hidden" name="delete_token" value="${esc(deleteToken)}"/>
 <button class="btn red" onclick="return confirm('Delete this file?')">Delete</button>
 </form>
 </div>
